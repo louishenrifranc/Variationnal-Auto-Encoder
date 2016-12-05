@@ -2,7 +2,7 @@ import lasagne
 from lasagne.layers import DenseLayer, InputLayer, DropoutLayer, get_all_params, get_output
 from GaussianLatentLayer import GaussianPropLayer
 from lasagne import nonlinearities
-from lasagne.init import GlorotUniform
+from lasagne import init
 import theano.tensor as T
 import numpy as np
 import theano
@@ -33,13 +33,8 @@ def load_dataset():
         # Read the inputs in Yann LeCun's binary format.
         with gzip.open(filename, 'rb') as f:
             data = np.frombuffer(f.read(), np.uint8, offset=16)
-        # The inputs are vectors now, we reshape them to monochrome 2D images,
-        # following the shape convention: (examples, channels, rows, columns)
 
         data = data.reshape(-1, 784)
-        # The inputs come as bytes, we convert them to float32 in range [0,1].
-        # (Actually to range [0, 255/256], for compatibility to the version
-        # provided at http://deeplearning.net/data/mnist/mnist.pkl.gz.)
         return data / np.float32(256)
 
     def load_mnist_labels(filename):
@@ -62,7 +57,6 @@ def load_dataset():
     y_train, y_val = y_train[:-10000], y_train[-10000:]
 
     # We just return all the arrays in order, as expected in main().
-    # (It doesn't matter how we do this as long as we can read them again.)
     return X_train, y_train, X_val, y_val, X_test, y_test
 
 
@@ -79,11 +73,15 @@ def iterate_minibatches(inputs, batchsize, shuffle=False):
 
 
 class VAE(object):
+    """
+    Variationnal Auto Encoder MNIST
+    """
+
     def __init__(self,
-                 batch_size=32,
+                 batch_size=64,
                  nb_features=784,
-                 hidden_size=300,
-                 dropout_hid=0.2,
+                 hidden_size=256,
+                 dropout_hid=0.3,
                  latent_space=128):
         self.BATCH_SIZE = batch_size
         self.INPUT_SIZE = nb_features
@@ -103,11 +101,15 @@ class VAE(object):
         # 1. Input Layer
         model['l_in'] = InputLayer(input_var=X_input,
                                    shape=(self.BATCH_SIZE, self.INPUT_SIZE))
-
+        #
+        # ENCODER
+        #
         # 2. Hidden layer of the encoder
         model['l_hid_enc'] = DenseLayer(model['l_in'],
                                         self.HIDDEN_SIZE,
-                                        nonlinearity=nonlinearities.tanh)
+                                        nonlinearity=nonlinearities.rectify,
+                                        W=init.Normal(mean=0, std=0.01),
+                                        b=init.Constant(0.0))
 
         # 2.bis Dropout layer on the hidden neurons of the encoder
         model['l_enc_drop'] = DropoutLayer(model['l_hid_enc'], p=dropout_hid)
@@ -124,10 +126,15 @@ class VAE(object):
         # 4. Sample from the latent distribution
         model['l_z'] = GaussianPropLayer(model['l_mu'], model['l_sttdev'])
 
+        #
+        # DECODER
+        #
         # 5. Hidden layer of the decoder
         model['l_hid_dec'] = DenseLayer(model['l_z'],
                                         self.HIDDEN_SIZE,
-                                        nonlinearity=nonlinearities.tanh)
+                                        nonlinearity=nonlinearities.rectify,
+                                        W=init.Normal(mean=0, std=0.01),
+                                        b=init.Constant(0.0))
         # 5.bis Dropout layer on the hidden neurons of the decoder
         model['l_dec_drop'] = DropoutLayer(model['l_hid_dec'], p=dropout_hid)
 
@@ -149,25 +156,25 @@ class VAE(object):
         # KL divergence for gaussian distribution
         # https://arxiv.org/pdf/1312.6114.pdf
         self.latent_loss = 0.5 * T.sum(T.square(z_mean) + T.square(z_sttdev) - T.log(T.square(z_sttdev)) - 1, axis=1)
-        # REconsturction
-        self.reconstruction_loss = -T.sum(
-            X_input * T.log(self.e + Y_output) + (1 - X_input) * T.log(1 - Y_output + self.e), axis=1)
-        self.loss = (self.latent_loss + self.reconstruction_loss)
+        # Reconstruction loss
+        self.reconstruction_loss = T.nnet.binary_crossentropy(Y_output, X_input).sum(axis=1)
+        # Reconstruction loss without Dropout (deterministic output)
+        self.reconstruction_loss_test = T.nnet.binary_crossentropy(Y_output_test, X_input).sum(axis=1)
 
-        self.reconstruction_loss_test = -T.sum(
-            X_input * T.log(self.e + Y_output_test) + (1 - X_input) * T.log(1 - Y_output_test + self.e), axis=1)
-        self.loss_test = (self.latent_loss + self.reconstruction_loss_test)
+        self.loss = self.latent_loss + self.reconstruction_loss
+        self.test_loss = self.latent_loss + self.reconstruction_loss_test
+        # Cost function
+        self.cost = T.mean(self.loss, axis=0)
+        self.test_cost = T.mean(self.test_loss, axis=0)
 
-        self.cost = T.mean(self.loss)
-        self.cost_test = -T.mean(self.loss_test)
-
+        # Parameters of the neural network
         all_params = get_all_params(model['l_out'])
 
+        # Adadelta optimizer (take into consideration the |windows_size| previous gradients)
         optimizer = lasagne.updates.adadelta(self.cost, all_params)
 
         self.train_fn = theano.function([X_input], self.cost, updates=optimizer)
-        self.test_fn = theano.function([X_input], self.cost_test)
-        self.z_mean_fn = theano.function([X_input],[z_sttdev, z_mean])
+        self.test_fn = theano.function([X_input], [self.test_cost, T.mean(self.reconstruction_loss_test, axis=0)])
 
     def train(self):
         X_train, y_train, X_val, yval, X_test, y_test = load_dataset()
@@ -176,29 +183,32 @@ class VAE(object):
             n_train_batches = 0
             start_time = time.time()
             for X_batch_train in iterate_minibatches(X_train, batchsize=self.BATCH_SIZE, shuffle=True):
-                train_err += self.train_fn(X_batch_train)
-                print(train_err)
+                err_train = self.train_fn(X_batch_train)
+                train_err += err_train
                 n_train_batches += 1
-               # print(self.z_mean_fn(X_batch_train)[0], self.z_mean_fn(X_batch_train)[1])
+
             val_err = 0
+            val_rec_err = 0
             n_val_batches = 0
             for X_batch_val in iterate_minibatches(X_val, self.BATCH_SIZE, shuffle=False):
                 err = self.test_fn(X_batch_val)
-                val_err += err
+                val_err += err[0]
+                val_rec_err += err[1]
                 n_val_batches += 1
             print("Epoch {} of {} took {:.3f}s".format(
                 epoch + 1, self.NUM_EPOCH, time.time() - start_time))
             print("  training loss:\t\t{:.6f}".format(train_err / n_train_batches))
             print("  validation loss:\t\t{:.6f}".format(val_err / n_val_batches))
+            print("  reconstruction loss:\t\t{:.6f}".format(val_rec_err / n_val_batches))
 
         test_err = 0
-        test_batches = 0
+        n_test_batches = 0
         for X_batch_test in iterate_minibatches(X_test, self.BATCH_SIZE, shuffle=False):
             err = self.test_fn(X_batch_test)
-            test_err += err
-            test_batches += 1
+            test_err += err[0]
+            n_test_batches += 1
         print("Final results:")
-        print("  test loss:\t\t\t{:.6f}".format(test_err / test_batches))
+        print("  test loss:\t\t\t{:.6f}".format(test_err / n_test_batches))
 
 
 if __name__ == '__main__':
